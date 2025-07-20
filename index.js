@@ -12,25 +12,52 @@ const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
+  },
+  pingTimeout: 60000, // 60 seconds
+  pingInterval: 25000, // 25 seconds
+  upgradeTimeout: 30000, // 30 seconds
+  allowUpgrades: true,
+  transports: ['websocket', 'polling'],
+  // Additional reliability settings
+  connectTimeout: 45000,
+  maxHttpBufferSize: 1e6, // 1MB
+  allowEIO3: true // Backward compatibility
 });
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static('public'));
 
 // Environment variables
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/watering_system';
 
-// MongoDB Connection
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('✅ Connected to MongoDB'))
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+// MongoDB Connection with better error handling
+mongoose.connect(MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000,
+})
+.then(() => console.log('✅ Connected to MongoDB'))
+.catch(err => console.error('❌ MongoDB connection error:', err));
+
+// Handle MongoDB disconnection
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠️ MongoDB disconnected');
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log('✅ MongoDB reconnected');
+});
 
 // Initialize Agenda for job scheduling
-const agenda = new Agenda({ db: { address: MONGODB_URI } });
+const agenda = new Agenda({ 
+  db: { address: MONGODB_URI },
+  processEvery: '30 seconds',
+  maxConcurrency: 20
+});
 
 // Device Schema
 const deviceSchema = new mongoose.Schema({
@@ -54,6 +81,12 @@ const deviceSchema = new mongoose.Schema({
     enum: ['idle', 'running'],
     default: 'idle'
   },
+  socketId: String, // Track current socket connection
+  connectionAttempts: {
+    type: Number,
+    default: 0
+  },
+  lastConnectionError: String,
   createdAt: { 
     type: Date, 
     default: Date.now 
@@ -89,80 +122,408 @@ const scheduleSchema = new mongoose.Schema({
     type: String,
     enum: ['pending', 'executed', 'failed', 'expired'],
     default: 'pending'
-  }
+  },
+  retryCount: {
+    type: Number,
+    default: 0
+  },
+  lastError: String
 });
 
 const Schedule = mongoose.model('Schedule', scheduleSchema);
 
-// Socket.IO connection handling
+// Connection tracking
 const connectedDevices = new Map();
+const connectedFrontends = new Map();
+const connectionStats = {
+  totalConnections: 0,
+  activeConnections: 0,
+  deviceConnections: 0,
+  frontendConnections: 0
+};
 
+// Socket.IO connection handling with enhanced error handling
 io.on('connection', (socket) => {
-  console.log('🔌 Socket client connected:', socket.id);
+  connectionStats.totalConnections++;
+  connectionStats.activeConnections++;
+  
+  console.log(`🔌 Socket client connected: ${socket.id} (Active: ${connectionStats.activeConnections})`);
+  
+  // Send connection acknowledgment with server info
+  socket.emit('connected', { 
+    status: 'connected', 
+    socketId: socket.id,
+    timestamp: new Date().toISOString(),
+    serverVersion: '2.0',
+    pingInterval: 25000,
+    pingTimeout: 60000
+  });
 
-  // Handle device joining their room
-  socket.on('join-device', (deviceId) => {
-    console.log(`📱 Device ${deviceId} joined room`);
-    socket.join(`device-${deviceId}`);
-    connectedDevices.set(deviceId, socket.id);
-    
-    // Update device status to online
-    Device.findOneAndUpdate(
-      { deviceId },
-      { 
+  // Enhanced device joining with error handling
+  socket.on('join-device', async (deviceId) => {
+    try {
+      if (!deviceId) {
+        socket.emit('join-error', { error: 'Device ID is required' });
+        return;
+      }
+
+      console.log(`📱 Device ${deviceId} joining room with socket ${socket.id}`);
+      
+      // Leave any existing rooms first
+      socket.rooms.forEach(room => {
+        if (room.startsWith('device-') && room !== socket.id) {
+          socket.leave(room);
+        }
+      });
+      
+      // Join new device room
+      socket.join(`device-${deviceId}`);
+      
+      // Check if device was already connected with different socket
+      const existingConnection = connectedDevices.get(deviceId);
+      if (existingConnection && existingConnection.socketId !== socket.id) {
+        console.log(`⚠️ Device ${deviceId} reconnecting with new socket (old: ${existingConnection.socketId}, new: ${socket.id})`);
+        // Disconnect old socket if still connected
+        const oldSocket = io.sockets.sockets.get(existingConnection.socketId);
+        if (oldSocket) {
+          oldSocket.disconnect(true);
+        }
+      }
+      
+      // Store device connection info
+      connectedDevices.set(deviceId, {
+        socketId: socket.id,
+        joinedAt: new Date(),
+        lastSeen: new Date(),
+        reconnectCount: existingConnection ? (existingConnection.reconnectCount || 0) + 1 : 0
+      });
+      
+      connectionStats.deviceConnections++;
+      
+      // Update device status in database
+      const updateResult = await Device.findOneAndUpdate(
+        { deviceId },
+        { 
+          status: 'online',
+          lastSeen: new Date(),
+          socketId: socket.id,
+          connectionAttempts: 0,
+          lastConnectionError: null
+        },
+        { 
+          upsert: true,
+          new: true,
+          runValidators: true
+        }
+      );
+      
+      console.log(`✅ Device ${deviceId} successfully joined and updated in database`);
+      
+      // Send confirmation back to device
+      socket.emit('device-joined', { 
+        deviceId, 
+        status: 'success',
+        message: 'Successfully joined device room',
+        reconnectCount: connectedDevices.get(deviceId).reconnectCount,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Notify all frontend clients about device connection
+      socket.broadcast.to('frontend').emit('device-connected', {
+        deviceId,
         status: 'online',
-        lastSeen: new Date()
-      }
-    ).exec();
-  });
-
-  // Handle pump status updates from device
-  socket.on('pump-status', (data) => {
-    console.log('💧 Pump status update:', data);
-    
-    // Update device pump status
-    Device.findOneAndUpdate(
-      { deviceId: data.deviceId },
-      { 
-        pumpStatus: data.status,
-        lastSeen: new Date()
-      }
-    ).exec();
-
-    // Broadcast to frontend clients
-    socket.broadcast.emit('pump-status-update', data);
-  });
-
-  // Handle frontend clients joining
-  socket.on('join-frontend', () => {
-    console.log('🖥️ Frontend client joined');
-    socket.join('frontend');
-  });
-
-  // Handle disconnect
-  socket.on('disconnect', () => {
-    console.log('❌ Socket client disconnected:', socket.id);
-    
-    // Find and update device status if it was a device connection
-    for (let [deviceId, socketId] of connectedDevices.entries()) {
-      if (socketId === socket.id) {
-        connectedDevices.delete(deviceId);
-        Device.findOneAndUpdate(
+        timestamp: new Date().toISOString(),
+        socketId: socket.id
+      });
+      
+    } catch (error) {
+      console.error(`❌ Error handling device join for ${deviceId}:`, error);
+      
+      // Update connection attempt count
+      try {
+        await Device.findOneAndUpdate(
           { deviceId },
           { 
-            status: 'offline',
-            pumpStatus: 'idle'
+            $inc: { connectionAttempts: 1 },
+            lastConnectionError: error.message,
+            lastSeen: new Date()
           }
-        ).exec();
-        break;
+        );
+      } catch (dbError) {
+        console.error('❌ Failed to update connection error in DB:', dbError);
+      }
+      
+      socket.emit('join-error', { 
+        error: 'Failed to join device room',
+        details: error.message,
+        deviceId
+      });
+    }
+  });
+
+  // Handle pump status updates with validation
+  socket.on('pump-status', async (data) => {
+    try {
+      if (!data || !data.deviceId || !data.status) {
+        socket.emit('status-error', { error: 'Invalid pump status data' });
+        return;
+      }
+
+      console.log('💧 Pump status update:', data);
+      
+      // Validate status value
+      const validStatuses = ['idle', 'running', 'stopped', 'error'];
+      if (!validStatuses.includes(data.status)) {
+        socket.emit('status-error', { error: 'Invalid pump status value' });
+        return;
+      }
+      
+      // Update device pump status with error handling
+      const updateData = { 
+        pumpStatus: data.status === 'stopped' ? 'idle' : data.status,
+        lastSeen: new Date()
+      };
+      
+      const device = await Device.findOneAndUpdate(
+        { deviceId: data.deviceId },
+        updateData,
+        { new: true }
+      );
+      
+      if (!device) {
+        console.warn(`⚠️ Pump status update for unknown device: ${data.deviceId}`);
+        socket.emit('status-error', { error: 'Device not found' });
+        return;
+      }
+      
+      // Update connection tracking
+      const connection = connectedDevices.get(data.deviceId);
+      if (connection) {
+        connection.lastSeen = new Date();
+      }
+      
+      // Enhanced status data for broadcasting
+      const statusUpdate = {
+        ...data,
+        timestamp: new Date().toISOString(),
+        deviceStatus: device.status,
+        lastSeen: device.lastSeen
+      };
+      
+      // Broadcast to frontend clients with acknowledgment
+      socket.broadcast.to('frontend').emit('pump-status-update', statusUpdate);
+      
+      // Send acknowledgment back to device
+      socket.emit('status-received', { 
+        deviceId: data.deviceId,
+        status: 'acknowledged',
+        timestamp: new Date().toISOString()
+      });
+      
+    } catch (error) {
+      console.error('❌ Error handling pump status update:', error);
+      socket.emit('status-error', { 
+        error: 'Failed to process status update',
+        details: error.message
+      });
+    }
+  });
+
+  // Enhanced frontend client handling
+  socket.on('join-frontend', async () => {
+    try {
+      console.log('🖥️ Frontend client joined');
+      socket.join('frontend');
+      
+      connectedFrontends.set(socket.id, {
+        joinedAt: new Date(),
+        lastActivity: new Date()
+      });
+      
+      connectionStats.frontendConnections++;
+      
+      // Send current system status to new frontend client
+      const devices = await Device.find().lean();
+      const activeSchedules = await Schedule.find({ 
+        status: 'pending',
+        time: { $gte: new Date() }
+      }).lean();
+      
+      socket.emit('frontend-joined', {
+        status: 'success',
+        timestamp: new Date().toISOString(),
+        systemStatus: {
+          totalDevices: devices.length,
+          onlineDevices: devices.filter(d => d.status === 'online').length,
+          activeSchedules: activeSchedules.length,
+          connectionStats
+        },
+        devices: devices.map(d => ({
+          deviceId: d.deviceId,
+          status: d.status,
+          pumpStatus: d.pumpStatus,
+          lastSeen: d.lastSeen,
+          socketId: d.socketId
+        }))
+      });
+      
+    } catch (error) {
+      console.error('❌ Error handling frontend join:', error);
+      socket.emit('join-error', { 
+        error: 'Failed to join frontend',
+        details: error.message
+      });
+    }
+  });
+
+  // Handle heartbeat/ping from devices
+  socket.on('heartbeat', async (data) => {
+    try {
+      if (data && data.deviceId) {
+        const connection = connectedDevices.get(data.deviceId);
+        if (connection) {
+          connection.lastSeen = new Date();
+        }
+        
+        // Update device last seen in database
+        await Device.findOneAndUpdate(
+          { deviceId: data.deviceId },
+          { lastSeen: new Date() }
+        );
+        
+        // Send heartbeat acknowledgment
+        socket.emit('heartbeat-ack', { 
+          timestamp: new Date().toISOString(),
+          serverTime: Date.now()
+        });
+      }
+    } catch (error) {
+      console.error('❌ Error handling heartbeat:', error);
+    }
+  });
+
+  // Handle generic pong responses
+  socket.on('pong', (data) => {
+    if (data && data.deviceId) {
+      const connection = connectedDevices.get(data.deviceId);
+      if (connection) {
+        connection.lastSeen = new Date();
       }
     }
   });
+
+  // Enhanced disconnect handling
+  socket.on('disconnect', async (reason) => {
+    connectionStats.activeConnections--;
+    
+    console.log(`❌ Socket client disconnected: ${socket.id} (Reason: ${reason})`);
+    
+    try {
+      // Handle device disconnection
+      for (let [deviceId, connectionInfo] of connectedDevices.entries()) {
+        if (connectionInfo.socketId === socket.id) {
+          console.log(`📱 Device ${deviceId} disconnected`);
+          
+          connectedDevices.delete(deviceId);
+          connectionStats.deviceConnections--;
+          
+          // Update device status in database
+          await Device.findOneAndUpdate(
+            { deviceId },
+            { 
+              status: 'offline',
+              pumpStatus: 'idle',
+              socketId: null,
+              lastSeen: new Date()
+            }
+          );
+          
+          // Notify frontend clients
+          socket.broadcast.to('frontend').emit('device-disconnected', {
+            deviceId,
+            status: 'offline',
+            reason,
+            timestamp: new Date().toISOString()
+          });
+          
+          break;
+        }
+      }
+      
+      // Handle frontend disconnection
+      if (connectedFrontends.has(socket.id)) {
+        connectedFrontends.delete(socket.id);
+        connectionStats.frontendConnections--;
+        console.log('🖥️ Frontend client disconnected');
+      }
+      
+    } catch (error) {
+      console.error('❌ Error handling disconnect:', error);
+    }
+  });
+
+  // Handle connection errors
+  socket.on('connect_error', (error) => {
+    console.error(`❌ Connection error for ${socket.id}:`, error);
+  });
+
+  // Handle Socket.IO errors
+  socket.on('error', (error) => {
+    console.error(`❌ Socket error for ${socket.id}:`, error);
+  });
 });
 
-// API Routes
+// Connection monitoring and cleanup
+setInterval(async () => {
+  try {
+    const now = new Date();
+    const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
+    
+    // Check for stale connections
+    for (let [deviceId, connectionInfo] of connectedDevices.entries()) {
+      if (connectionInfo.lastSeen < fiveMinutesAgo) {
+        console.log(`⚠️ Cleaning up stale connection for device: ${deviceId}`);
+        
+        connectedDevices.delete(deviceId);
+        connectionStats.deviceConnections--;
+        
+        // Update database
+        await Device.findOneAndUpdate(
+          { deviceId },
+          { 
+            status: 'offline',
+            pumpStatus: 'idle',
+            socketId: null
+          }
+        );
+        
+        // Notify frontends
+        io.to('frontend').emit('device-disconnected', {
+          deviceId,
+          status: 'offline',
+          reason: 'timeout',
+          timestamp: now.toISOString()
+        });
+      }
+    }
+    
+    // Cleanup frontend connections
+    for (let [socketId, connectionInfo] of connectedFrontends.entries()) {
+      if (connectionInfo.lastActivity < fiveMinutesAgo) {
+        const socket = io.sockets.sockets.get(socketId);
+        if (!socket || !socket.connected) {
+          connectedFrontends.delete(socketId);
+          connectionStats.frontendConnections--;
+        }
+      }
+    }
+    
+  } catch (error) {
+    console.error('❌ Error in connection cleanup:', error);
+  }
+}, 60000); // Run every minute
 
-// Register device
+// API Routes with enhanced error handling
 app.post('/api/devices/register', async (req, res) => {
   try {
     const { deviceId, ip, timestamp } = req.body;
@@ -181,6 +542,8 @@ app.post('/api/devices/register', async (req, res) => {
       device.ip = ip;
       device.lastSeen = new Date();
       device.status = 'online';
+      device.connectionAttempts = 0;
+      device.lastConnectionError = null;
       await device.save();
       console.log(`🔄 Updated existing device: ${deviceId}`);
     } else {
@@ -200,7 +563,12 @@ app.post('/api/devices/register', async (req, res) => {
       device: {
         deviceId: device.deviceId,
         status: device.status,
-        lastSeen: device.lastSeen
+        lastSeen: device.lastSeen,
+        connectionAttempts: device.connectionAttempts
+      },
+      serverInfo: {
+        socketUrl: req.get('host'),
+        timestamp: new Date().toISOString()
       }
     });
 
@@ -208,6 +576,119 @@ app.post('/api/devices/register', async (req, res) => {
     console.error('❌ Device registration error:', error);
     res.status(500).json({
       error: 'Failed to register device',
+      details: error.message
+    });
+  }
+});
+
+// Enhanced manual water command with better error handling
+app.post('/api/devices/:deviceId/water', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { action, duration } = req.body;
+
+    if (!action) {
+      return res.status(400).json({ error: 'Action is required' });
+    }
+
+    // Check if device exists and is online
+    const device = await Device.findOne({ deviceId });
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+
+    if (device.status !== 'online') {
+      return res.status(409).json({ 
+        error: 'Device is offline',
+        deviceStatus: device.status,
+        lastSeen: device.lastSeen
+      });
+    }
+
+    // Check if device is connected via socket
+    const connection = connectedDevices.get(deviceId);
+    if (!connection) {
+      return res.status(409).json({ 
+        error: 'Device is not connected via socket',
+        suggestion: 'Device may need to reconnect'
+      });
+    }
+
+    console.log(`💧 Manual water command for ${deviceId}: ${action} (${duration}ms)`);
+
+    // Prepare command data
+    const commandData = {
+      action,
+      duration: duration || 0,
+      commandId: `cmd_${Date.now()}`,
+      timestamp: new Date().toISOString()
+    };
+
+    // Send command to device via Socket.IO with timeout
+    const deviceRoom = `device-${deviceId}`;
+    const socketsInRoom = await io.in(deviceRoom).fetchSockets();
+    
+    if (socketsInRoom.length === 0) {
+      return res.status(409).json({ 
+        error: 'No active socket connection for device',
+        deviceId
+      });
+    }
+
+    // Send to device
+    io.to(deviceRoom).emit('water-command', commandData);
+    
+    // Also broadcast to frontend
+    io.to('frontend').emit('manual-command', {
+      deviceId,
+      ...commandData
+    });
+
+    res.json({
+      success: true,
+      message: `Water command sent to device ${deviceId}`,
+      command: commandData,
+      activeConnections: socketsInRoom.length
+    });
+
+  } catch (error) {
+    console.error('❌ Manual water command error:', error);
+    res.status(500).json({
+      error: 'Failed to send water command',
+      details: error.message
+    });
+  }
+});
+
+// System status endpoint
+app.get('/api/system/status', async (req, res) => {
+  try {
+    const devices = await Device.find().lean();
+    const schedules = await Schedule.find({ status: 'pending' }).lean();
+    
+    res.json({
+      success: true,
+      systemStatus: {
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        connections: connectionStats,
+        database: {
+          connected: mongoose.connection.readyState === 1,
+          totalDevices: devices.length,
+          onlineDevices: devices.filter(d => d.status === 'online').length,
+          pendingSchedules: schedules.length
+        },
+        memory: process.memoryUsage(),
+        socketConnections: {
+          total: io.engine.clientsCount,
+          devices: connectedDevices.size,
+          frontends: connectedFrontends.size
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to get system status',
       details: error.message
     });
   }
