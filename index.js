@@ -10,7 +10,7 @@ const app = express();
 const server = http.createServer(app);
 
 // UPDATED Socket.IO configuration for ESP8266 compatibility
-const io = new Server(server, {
+const io = require('socket.io')(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
