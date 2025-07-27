@@ -17,22 +17,9 @@ const io = require('socket.io')(server, {
   },
   pingTimeout: 60000,
   pingInterval: 25000,
-  upgradeTimeout: 30000,
-  allowUpgrades: true,
   transports: ['websocket', 'polling'],
-  connectTimeout: 45000,
-  maxHttpBufferSize: 1e6,
-  // CRITICAL: Add these lines for ESP8266 compatibility
-  allowEIO3: true,  // Allow Engine.IO v3 for older ESP8266 libraries
-  allowEIO4: true,  // Also allow v4 for newer clients
-  // Additional compatibility settings
-  serveClient: false,
-  cookie: false,
-  // Reduce protocol strictness for embedded devices
-  allowRequest: (req, callback) => {
-    // Allow all connections for now - customize as needed
-    callback(null, true);
-  }
+  allowUpgrades: true
+  // REMOVE the others!
 });
 
 // Middleware
@@ -720,7 +707,8 @@ app.post('/api/devices/:deviceId/water', async (req, res) => {
 
     // Send command to device via Socket.IO with timeout
     const deviceRoom = `device-${deviceId}`;
-    const socketsInRoom = await io.in(deviceRoom).fetchSockets();
+    const room = io.sockets.adapter.rooms[deviceRoom];
+    const socketsInRoom = room ? Object.keys(room.sockets) : [];
     
     if (socketsInRoom.length === 0) {
       return res.status(409).json({ 
