@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
+const https = require('https');
 const cors = require('cors');
 const Agenda = require('agenda');
 require('dotenv').config();
@@ -9,11 +10,13 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// WebSocket Server
-const wss = new WebSocket.Server({ 
+// WebSocket Server with proper configuration for ESP8266
+const wss = new WebSocket.Server({
   server,
   path: '/ws',
-  perMessageDeflate: false // Better for ESP8266
+  perMessageDeflate: false, // Important for ESP8266 compatibility
+  clientTracking: true,
+  maxPayload: 1024 * 1024, // 1MB max payload
 });
 
 // Middleware
@@ -35,8 +38,8 @@ mongoose.connect(MONGODB_URI, {
 .then(() => console.log('✅ Connected to MongoDB'))
 .catch(err => console.error('❌ MongoDB connection error:', err));
 
-// Initialize Agenda for job scheduling
-const agenda = new Agenda({ 
+// Initialize Agenda
+const agenda = new Agenda({
   db: { address: MONGODB_URI },
   processEvery: '30 seconds',
   maxConcurrency: 20
@@ -44,20 +47,20 @@ const agenda = new Agenda({
 
 // Device Schema
 const deviceSchema = new mongoose.Schema({
-  deviceId: { 
-    type: String, 
-    required: true, 
-    unique: true 
+  deviceId: {
+    type: String,
+    required: true,
+    unique: true
   },
   ip: String,
-  lastSeen: { 
-    type: Date, 
-    default: Date.now 
+  lastSeen: {
+    type: Date,
+    default: Date.now
   },
-  status: { 
-    type: String, 
-    enum: ['online', 'offline'], 
-    default: 'offline' 
+  status: {
+    type: String,
+    enum: ['online', 'offline'],
+    default: 'offline'
   },
   pumpStatus: {
     type: String,
@@ -69,9 +72,9 @@ const deviceSchema = new mongoose.Schema({
     default: 0
   },
   lastConnectionError: String,
-  createdAt: { 
-    type: Date, 
-    default: Date.now 
+  createdAt: {
+    type: Date,
+    default: Date.now
   }
 });
 
@@ -79,25 +82,25 @@ const Device = mongoose.model('Device', deviceSchema);
 
 // Schedule Schema
 const scheduleSchema = new mongoose.Schema({
-  deviceId: { 
-    type: String, 
-    required: true 
+  deviceId: {
+    type: String,
+    required: true
   },
-  time: { 
-    type: Date, 
-    required: true 
+  time: {
+    type: Date,
+    required: true
   },
-  duration: { 
-    type: Number, 
-    required: true 
+  duration: {
+    type: Number,
+    required: true
   },
-  executed: { 
-    type: Boolean, 
-    default: false 
+  executed: {
+    type: Boolean,
+    default: false
   },
-  createdAt: { 
-    type: Date, 
-    default: Date.now 
+  createdAt: {
+    type: Date,
+    default: Date.now
   },
   executedAt: Date,
   status: {
@@ -153,13 +156,18 @@ const MESSAGE_TYPE = {
 // Utility functions
 function sendMessage(ws, type, data = {}) {
   if (ws.readyState === WebSocket.OPEN) {
-    const message = JSON.stringify({
-      type,
-      data,
-      timestamp: new Date().toISOString()
-    });
-    ws.send(message);
-    return true;
+    try {
+      const message = JSON.stringify({
+        type,
+        data,
+        timestamp: new Date().toISOString()
+      });
+      ws.send(message);
+      return true;
+    } catch (error) {
+      console.error('❌ Error sending message:', error);
+      return false;
+    }
   }
   return false;
 }
@@ -183,7 +191,8 @@ wss.on('connection', (ws, req) => {
   connectionStats.totalConnections++;
   connectionStats.activeConnections++;
   
-  console.log(`🔌 WebSocket client connected from ${req.socket.remoteAddress}`);
+  const clientIP = req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown';
+  console.log(`🔌 WebSocket client connected from ${clientIP}`);
   
   // Send welcome message
   sendMessage(ws, 'connected', { 
@@ -191,15 +200,27 @@ wss.on('connection', (ws, req) => {
     timestamp: new Date().toISOString(),
     serverVersion: '2.0'
   });
-
-  ws.on('message', async (message) => {
+  
+  // Set up ping/pong for keep-alive
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
+  }, 30000);
+  
+  ws.on('pong', () => {
+    console.log('📡 Pong received from client');
+  });
+  
+  ws.on('message', async (data) => {
     try {
+      const message = data.toString();
       const parsedMessage = JSON.parse(message);
-      const { type, data } = parsedMessage;
+      const { type, data: messageData } = parsedMessage;
       
-      console.log(`📥 WebSocket message: ${type}`, data);
+      console.log(`📥 WebSocket message: ${type}`, messageData);
       
-      await handleWebSocketMessage(ws, type, data);
+      await handleWebSocketMessage(ws, type, messageData);
       
     } catch (error) {
       console.error('❌ Error parsing WebSocket message:', error);
@@ -209,8 +230,9 @@ wss.on('connection', (ws, req) => {
       });
     }
   });
-
+  
   ws.on('close', async (code, reason) => {
+    clearInterval(pingInterval);
     connectionStats.activeConnections--;
     console.log(`❌ WebSocket client disconnected: ${code} - ${reason}`);
     
@@ -230,7 +252,7 @@ wss.on('connection', (ws, req) => {
             pumpStatus: 'idle',
             lastSeen: new Date()
           }
-        );
+        ).catch(err => console.error('DB update error:', err));
         
         // Notify frontend clients
         broadcastToFrontends(MESSAGE_TYPE.DEVICE_DISCONNECTED, {
@@ -250,58 +272,58 @@ wss.on('connection', (ws, req) => {
       console.log('🖥️ Frontend client disconnected');
     }
   });
-
+  
   ws.on('error', (error) => {
     console.error('❌ WebSocket error:', error);
+    clearInterval(pingInterval);
   });
-
-  // Send ping every 30 seconds to keep connection alive
-  const pingInterval = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    } else {
-      clearInterval(pingInterval);
-    }
-  }, 30000);
 });
 
 // WebSocket message handler
 async function handleWebSocketMessage(ws, type, data) {
-  switch (type) {
-    case MESSAGE_TYPE.DEVICE_JOIN:
-      await handleDeviceJoin(ws, data);
-      break;
-      
-    case MESSAGE_TYPE.PUMP_STATUS:
-      await handlePumpStatus(ws, data);
-      break;
-      
-    case MESSAGE_TYPE.HEARTBEAT:
-      await handleHeartbeat(ws, data);
-      break;
-      
-    case MESSAGE_TYPE.COMMAND_ACK:
-      await handleCommandAck(ws, data);
-      break;
-      
-    case MESSAGE_TYPE.SCHEDULE_EXECUTED:
-      await handleScheduleExecuted(ws, data);
-      break;
-      
-    case MESSAGE_TYPE.FRONTEND_JOIN:
-      await handleFrontendJoin(ws);
-      break;
-      
-    case MESSAGE_TYPE.MANUAL_COMMAND:
-      await handleManualCommand(ws, data);
-      break;
-      
-    default:
-      console.warn(`❓ Unknown message type: ${type}`);
-      sendMessage(ws, MESSAGE_TYPE.ERROR, { 
-        error: 'Unknown message type',
-        type 
-      });
+  try {
+    switch (type) {
+      case MESSAGE_TYPE.DEVICE_JOIN:
+        await handleDeviceJoin(ws, data);
+        break;
+        
+      case MESSAGE_TYPE.PUMP_STATUS:
+        await handlePumpStatus(ws, data);
+        break;
+        
+      case MESSAGE_TYPE.HEARTBEAT:
+        await handleHeartbeat(ws, data);
+        break;
+        
+      case MESSAGE_TYPE.COMMAND_ACK:
+        await handleCommandAck(ws, data);
+        break;
+        
+      case MESSAGE_TYPE.SCHEDULE_EXECUTED:
+        await handleScheduleExecuted(ws, data);
+        break;
+        
+      case MESSAGE_TYPE.FRONTEND_JOIN:
+        await handleFrontendJoin(ws);
+        break;
+        
+      case MESSAGE_TYPE.MANUAL_COMMAND:
+        await handleManualCommand(ws, data);
+        break;
+        
+      default:
+        console.warn(`❓ Unknown message type: ${type}`);
+        sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+          error: 'Unknown message type',
+          type 
+        });
+    }
+  } catch (error) {
+    console.error(`❌ Error handling message type ${type}:`, error);
+    sendMessage(ws, MESSAGE_TYPE.ERROR, {
+      error: 'Internal server error',
+      details: error.message
+    });
   }
 }
 
@@ -321,7 +343,6 @@ async function handleDeviceJoin(ws, data) {
     const existingConnection = connectedDevices.get(deviceId);
     if (existingConnection && existingConnection.ws !== ws) {
       console.log(`⚠️ Device ${deviceId} reconnecting with new WebSocket`);
-      // Close old connection
       if (existingConnection.ws.readyState === WebSocket.OPEN) {
         existingConnection.ws.close();
       }
@@ -643,19 +664,19 @@ setInterval(async () => {
   }
 }, 60000);
 
-// REST API Routes (keeping existing ones)
+// REST API Routes
 app.post('/api/devices/register', async (req, res) => {
   try {
     const { deviceId, ip } = req.body;
-
+    
     if (!deviceId) {
       return res.status(400).json({ error: 'Device ID is required' });
     }
-
+    
     console.log(`📡 Device registration request: ${deviceId} from IP: ${ip}`);
-
+    
     let device = await Device.findOne({ deviceId });
-
+    
     if (device) {
       device.ip = ip;
       device.lastSeen = new Date();
@@ -673,7 +694,7 @@ app.post('/api/devices/register', async (req, res) => {
       await device.save();
       console.log(`✅ Registered new device: ${deviceId}`);
     }
-
+    
     res.json({
       success: true,
       message: 'Device registered successfully',
@@ -687,7 +708,7 @@ app.post('/api/devices/register', async (req, res) => {
         timestamp: new Date().toISOString()
       }
     });
-
+    
   } catch (error) {
     console.error('❌ Device registration error:', error);
     res.status(500).json({
@@ -697,84 +718,7 @@ app.post('/api/devices/register', async (req, res) => {
   }
 });
 
-// Manual water command via REST API
-app.post('/api/devices/:deviceId/water', async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const { action, duration } = req.body;
-
-    if (!action) {
-      return res.status(400).json({ error: 'Action is required' });
-    }
-
-    const device = await Device.findOne({ deviceId });
-    if (!device) {
-      return res.status(404).json({ error: 'Device not found' });
-    }
-
-    if (device.status !== 'online') {
-      return res.status(409).json({ 
-        error: 'Device is offline',
-        deviceStatus: device.status,
-        lastSeen: device.lastSeen
-      });
-    }
-
-    const commandData = {
-      action,
-      duration: duration || 0,
-      commandId: `cmd_${Date.now()}`,
-      timestamp: new Date().toISOString()
-    };
-
-    const sent = sendToDevice(deviceId, MESSAGE_TYPE.WATER_COMMAND, commandData);
-
-    if (sent) {
-      res.json({
-        success: true,
-        message: `Water command sent to device ${deviceId}`,
-        command: commandData
-      });
-    } else {
-      res.status(409).json({ 
-        error: 'Device is not connected via WebSocket'
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Manual water command error:', error);
-    res.status(500).json({
-      error: 'Failed to send water command',
-      details: error.message
-    });
-  }
-});
-
-// Get device info
-app.get('/api/devices/:deviceId', async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const device = await Device.findOne({ deviceId });
-    
-    if (!device) {
-      return res.status(404).json({ error: 'Device not found' });
-    }
-
-    res.json({
-      success: true,
-      device
-    });
-
-  } catch (error) {
-    console.error('❌ Get device error:', error);
-    res.status(500).json({
-      error: 'Failed to get device',
-      details: error.message
-    });
-  }
-});
-
-// Schedule endpoints (keeping existing ones)
+// Get device schedules
 app.get('/api/devices/:deviceId/schedules', async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -784,7 +728,7 @@ app.get('/api/devices/:deviceId/schedules', async (req, res) => {
       status: 'pending',
       time: { $gte: new Date() }
     }).sort({ time: 1 });
-
+    
     res.json({
       success: true,
       schedules: schedules.map(schedule => ({
@@ -794,7 +738,7 @@ app.get('/api/devices/:deviceId/schedules', async (req, res) => {
         status: schedule.status
       }))
     });
-
+    
   } catch (error) {
     console.error('❌ Get schedules error:', error);
     res.status(500).json({
@@ -804,36 +748,37 @@ app.get('/api/devices/:deviceId/schedules', async (req, res) => {
   }
 });
 
+// Create schedule
 app.post('/api/schedules', async (req, res) => {
   try {
     const { deviceId, time, duration } = req.body;
-
+    
     if (!deviceId || !time || !duration) {
       return res.status(400).json({
         error: 'Device ID, time, and duration are required'
       });
     }
-
+    
     const device = await Device.findOne({ deviceId });
     if (!device) {
       return res.status(404).json({ error: 'Device not found' });
     }
-
+    
     const schedule = new Schedule({
       deviceId,
       time: new Date(time),
       duration: parseInt(duration)
     });
-
+    
     await schedule.save();
-
+    
     // Schedule the job with Agenda
     await agenda.schedule(new Date(time), 'execute watering', {
       scheduleId: schedule._id.toString(),
       deviceId,
       duration: parseInt(duration)
     });
-
+    
     res.json({
       success: true,
       message: 'Schedule created successfully',
@@ -845,11 +790,64 @@ app.post('/api/schedules', async (req, res) => {
         status: schedule.status
       }
     });
-
+    
   } catch (error) {
     console.error('❌ Create schedule error:', error);
     res.status(500).json({
       error: 'Failed to create schedule',
+      details: error.message
+    });
+  }
+});
+
+// Manual water command
+app.post('/api/devices/:deviceId/water', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { action, duration } = req.body;
+    
+    if (!action) {
+      return res.status(400).json({ error: 'Action is required' });
+    }
+    
+    const device = await Device.findOne({ deviceId });
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+    
+    if (device.status !== 'online') {
+      return res.status(409).json({ 
+        error: 'Device is offline',
+        deviceStatus: device.status,
+        lastSeen: device.lastSeen
+      });
+    }
+    
+    const commandData = {
+      action,
+      duration: duration || 0,
+      commandId: `cmd_${Date.now()}`,
+      timestamp: new Date().toISOString()
+    };
+    
+    const sent = sendToDevice(deviceId, MESSAGE_TYPE.WATER_COMMAND, commandData);
+    
+    if (sent) {
+      res.json({
+        success: true,
+        message: `Water command sent to device ${deviceId}`,
+        command: commandData
+      });
+    } else {
+      res.status(409).json({ 
+        error: 'Device is not connected via WebSocket'
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Manual water command error:', error);
+    res.status(500).json({
+      error: 'Failed to send water command',
       details: error.message
     });
   }
@@ -861,12 +859,12 @@ agenda.define('execute watering', async (job) => {
   
   try {
     console.log(`⏰ Executing scheduled watering for device ${deviceId} (${duration}ms)`);
-
+    
     await Schedule.findByIdAndUpdate(scheduleId, {
       status: 'executed',
       executedAt: new Date()
     });
-
+    
     const device = await Device.findOne({ deviceId });
     if (!device || device.status !== 'online') {
       console.log(`⚠️ Device ${deviceId} is offline, marking schedule as failed`);
@@ -876,7 +874,7 @@ agenda.define('execute watering', async (job) => {
       });
       return;
     }
-
+    
     // Send watering command via WebSocket
     const sent = sendToDevice(deviceId, MESSAGE_TYPE.WATER_COMMAND, {
       action: 'water',
@@ -884,9 +882,8 @@ agenda.define('execute watering', async (job) => {
       scheduleId,
       commandId: `schedule_${scheduleId}_${Date.now()}`
     });
-
+    
     if (sent) {
-      // Notify frontend
       broadcastToFrontends('schedule_executed', {
         deviceId,
         scheduleId,
@@ -901,7 +898,7 @@ agenda.define('execute watering', async (job) => {
         lastError: 'Device not connected'
       });
     }
-
+    
   } catch (error) {
     console.error('❌ Scheduled watering execution error:', error);
     
@@ -912,21 +909,23 @@ agenda.define('execute watering', async (job) => {
   }
 });
 
-// Start agenda
-(async function() {
-  await agenda.start();
-  console.log('⏰ Agenda scheduler started');
-})();
-
 // Basic route
 app.get('/', (req, res) => {
   res.json({
     message: '💧 Smart Watering System Backend (WebSocket)',
     status: 'running',
     timestamp: new Date().toISOString(),
-    wsEndpoint: '/ws'
+    wsEndpoint: '/ws',
+    activeConnections: connectionStats.activeConnections,
+    devices: connectionStats.deviceConnections
   });
 });
+
+// Start agenda
+(async function() {
+  await agenda.start();
+  console.log('⏰ Agenda scheduler started');
+})();
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
