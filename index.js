@@ -8,20 +8,31 @@ require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
+
+// UPDATED Socket.IO configuration for ESP8266 compatibility
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
   },
-  pingTimeout: 60000, // 60 seconds
-  pingInterval: 25000, // 25 seconds
-  upgradeTimeout: 30000, // 30 seconds
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  upgradeTimeout: 30000,
   allowUpgrades: true,
   transports: ['websocket', 'polling'],
-  // Additional reliability settings
   connectTimeout: 45000,
-  maxHttpBufferSize: 1e6, // 1MB
-  allowEIO3: true // Backward compatibility
+  maxHttpBufferSize: 1e6,
+  // CRITICAL: Add these lines for ESP8266 compatibility
+  allowEIO3: true,  // Allow Engine.IO v3 for older ESP8266 libraries
+  allowEIO4: true,  // Also allow v4 for newer clients
+  // Additional compatibility settings
+  serveClient: false,
+  cookie: false,
+  // Reduce protocol strictness for embedded devices
+  allowRequest: (req, callback) => {
+    // Allow all connections for now - customize as needed
+    callback(null, true);
+  }
 });
 
 // Middleware
@@ -81,12 +92,13 @@ const deviceSchema = new mongoose.Schema({
     enum: ['idle', 'running'],
     default: 'idle'
   },
-  socketId: String, // Track current socket connection
+  socketId: String,
   connectionAttempts: {
     type: Number,
     default: 0
   },
   lastConnectionError: String,
+  engineIOVersion: String, // Track which EIO version device is using
   createdAt: { 
     type: Date, 
     default: Date.now 
@@ -139,27 +151,43 @@ const connectionStats = {
   totalConnections: 0,
   activeConnections: 0,
   deviceConnections: 0,
-  frontendConnections: 0
+  frontendConnections: 0,
+  eio3Connections: 0,
+  eio4Connections: 0
 };
 
-// Socket.IO connection handling with enhanced error handling
+// Enhanced Socket.IO connection handling with ESP8266 support
 io.on('connection', (socket) => {
   connectionStats.totalConnections++;
   connectionStats.activeConnections++;
   
-  console.log(`🔌 Socket client connected: ${socket.id} (Active: ${connectionStats.activeConnections})`);
+  // Detect Engine.IO version
+  const eioVersion = socket.handshake.query.EIO || socket.conn.protocol;
+  console.log(`🔌 Socket client connected: ${socket.id} (EIO: ${eioVersion}, Active: ${connectionStats.activeConnections})`);
   
-  // Send connection acknowledgment with server info
+  // Track EIO version stats
+  if (eioVersion === '3') {
+    connectionStats.eio3Connections++;
+  } else if (eioVersion === '4') {
+    connectionStats.eio4Connections++;
+  }
+  
+  // Send connection acknowledgment with compatibility info
   socket.emit('connected', { 
     status: 'connected', 
     socketId: socket.id,
     timestamp: new Date().toISOString(),
     serverVersion: '2.0',
+    engineIOVersion: eioVersion,
     pingInterval: 25000,
-    pingTimeout: 60000
+    pingTimeout: 60000,
+    compatibility: {
+      eio3Supported: true,
+      eio4Supported: true
+    }
   });
 
-  // Enhanced device joining with error handling
+  // Enhanced device joining with ESP8266 compatibility
   socket.on('join-device', async (deviceId) => {
     try {
       if (!deviceId) {
@@ -167,7 +195,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      console.log(`📱 Device ${deviceId} joining room with socket ${socket.id}`);
+      console.log(`📱 Device ${deviceId} joining room with socket ${socket.id} (EIO: ${eioVersion})`);
       
       // Leave any existing rooms first
       socket.rooms.forEach(room => {
@@ -195,6 +223,7 @@ io.on('connection', (socket) => {
         socketId: socket.id,
         joinedAt: new Date(),
         lastSeen: new Date(),
+        engineIOVersion: eioVersion,
         reconnectCount: existingConnection ? (existingConnection.reconnectCount || 0) + 1 : 0
       });
       
@@ -208,7 +237,8 @@ io.on('connection', (socket) => {
           lastSeen: new Date(),
           socketId: socket.id,
           connectionAttempts: 0,
-          lastConnectionError: null
+          lastConnectionError: null,
+          engineIOVersion: eioVersion
         },
         { 
           upsert: true,
@@ -217,14 +247,19 @@ io.on('connection', (socket) => {
         }
       );
       
-      console.log(`✅ Device ${deviceId} successfully joined and updated in database`);
+      console.log(`✅ Device ${deviceId} successfully joined and updated in database (EIO: ${eioVersion})`);
       
-      // Send confirmation back to device
+      // Send confirmation back to device with compatibility info
       socket.emit('device-joined', { 
         deviceId, 
         status: 'success',
         message: 'Successfully joined device room',
         reconnectCount: connectedDevices.get(deviceId).reconnectCount,
+        engineIOVersion: eioVersion,
+        serverCompatibility: {
+          eio3: true,
+          eio4: true
+        },
         timestamp: new Date().toISOString()
       });
       
@@ -232,6 +267,7 @@ io.on('connection', (socket) => {
       socket.broadcast.to('frontend').emit('device-connected', {
         deviceId,
         status: 'online',
+        engineIOVersion: eioVersion,
         timestamp: new Date().toISOString(),
         socketId: socket.id
       });
@@ -256,7 +292,8 @@ io.on('connection', (socket) => {
       socket.emit('join-error', { 
         error: 'Failed to join device room',
         details: error.message,
-        deviceId
+        deviceId,
+        suggestion: 'Try different Engine.IO version or connection method'
       });
     }
   });
@@ -363,7 +400,8 @@ io.on('connection', (socket) => {
           status: d.status,
           pumpStatus: d.pumpStatus,
           lastSeen: d.lastSeen,
-          socketId: d.socketId
+          socketId: d.socketId,
+          engineIOVersion: d.engineIOVersion
         }))
       });
       
@@ -376,7 +414,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle heartbeat/ping from devices
+  // Handle heartbeat/ping from devices with ESP8266 compatibility
   socket.on('heartbeat', async (data) => {
     try {
       if (data && data.deviceId) {
@@ -402,6 +440,49 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle schedule execution acknowledgment
+  socket.on('schedule-executed', async (data) => {
+    try {
+      if (data && data.scheduleId && data.deviceId) {
+        console.log(`✅ Schedule execution confirmed by device ${data.deviceId}: ${data.scheduleId}`);
+        
+        // Update schedule status
+        await Schedule.findByIdAndUpdate(data.scheduleId, {
+          status: 'executed',
+          executedAt: new Date()
+        });
+        
+        // Notify frontend
+        socket.broadcast.to('frontend').emit('schedule-execution-confirmed', {
+          deviceId: data.deviceId,
+          scheduleId: data.scheduleId,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      console.error('❌ Error handling schedule execution confirmation:', error);
+    }
+  });
+
+  // Handle command acknowledgments
+  socket.on('command-ack', async (data) => {
+    try {
+      if (data && data.commandId && data.deviceId) {
+        console.log(`✅ Command acknowledged by device ${data.deviceId}: ${data.commandId}`);
+        
+        // Notify frontend
+        socket.broadcast.to('frontend').emit('command-acknowledged', {
+          deviceId: data.deviceId,
+          commandId: data.commandId,
+          status: data.status,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      console.error('❌ Error handling command acknowledgment:', error);
+    }
+  });
+
   // Handle generic pong responses
   socket.on('pong', (data) => {
     if (data && data.deviceId) {
@@ -416,13 +497,20 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async (reason) => {
     connectionStats.activeConnections--;
     
-    console.log(`❌ Socket client disconnected: ${socket.id} (Reason: ${reason})`);
+    // Update EIO version stats
+    if (eioVersion === '3') {
+      connectionStats.eio3Connections--;
+    } else if (eioVersion === '4') {
+      connectionStats.eio4Connections--;
+    }
+    
+    console.log(`❌ Socket client disconnected: ${socket.id} (Reason: ${reason}, EIO: ${eioVersion})`);
     
     try {
       // Handle device disconnection
       for (let [deviceId, connectionInfo] of connectedDevices.entries()) {
         if (connectionInfo.socketId === socket.id) {
-          console.log(`📱 Device ${deviceId} disconnected`);
+          console.log(`📱 Device ${deviceId} disconnected (EIO: ${eioVersion})`);
           
           connectedDevices.delete(deviceId);
           connectionStats.deviceConnections--;
@@ -443,6 +531,7 @@ io.on('connection', (socket) => {
             deviceId,
             status: 'offline',
             reason,
+            engineIOVersion: eioVersion,
             timestamp: new Date().toISOString()
           });
           
@@ -568,7 +657,12 @@ app.post('/api/devices/register', async (req, res) => {
       },
       serverInfo: {
         socketUrl: req.get('host'),
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        socketIOCompatibility: {
+          eio3Supported: true,
+          eio4Supported: true,
+          transports: ['websocket', 'polling']
+        }
       }
     });
 
@@ -648,7 +742,8 @@ app.post('/api/devices/:deviceId/water', async (req, res) => {
       success: true,
       message: `Water command sent to device ${deviceId}`,
       command: commandData,
-      activeConnections: socketsInRoom.length
+      activeConnections: socketsInRoom.length,
+      deviceEngineIO: connection.engineIOVersion
     });
 
   } catch (error) {
@@ -660,7 +755,7 @@ app.post('/api/devices/:deviceId/water', async (req, res) => {
   }
 });
 
-// System status endpoint
+// System status endpoint with EIO version info
 app.get('/api/system/status', async (req, res) => {
   try {
     const devices = await Device.find().lean();
@@ -683,6 +778,14 @@ app.get('/api/system/status', async (req, res) => {
           total: io.engine.clientsCount,
           devices: connectedDevices.size,
           frontends: connectedFrontends.size
+        },
+        compatibility: {
+          engineIOVersions: {
+            v3Connections: connectionStats.eio3Connections,
+            v4Connections: connectionStats.eio4Connections
+          },
+          supportedTransports: ['websocket', 'polling'],
+          esp8266Compatible: true
         }
       }
     });
@@ -850,53 +953,6 @@ app.get('/api/schedules', async (req, res) => {
   }
 });
 
-// Manual water command
-app.post('/api/devices/:deviceId/water', async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const { action, duration } = req.body;
-
-    if (!action) {
-      return res.status(400).json({ error: 'Action is required' });
-    }
-
-    // Check if device is online
-    const device = await Device.findOne({ deviceId });
-    if (!device) {
-      return res.status(404).json({ error: 'Device not found' });
-    }
-
-    console.log(`💧 Manual water command for ${deviceId}: ${action} (${duration}ms)`);
-
-    // Send command to device via Socket.IO
-    io.to(`device-${deviceId}`).emit('water-command', {
-      action,
-      duration: duration || 0
-    });
-
-    // Also broadcast to frontend
-    io.to('frontend').emit('manual-command', {
-      deviceId,
-      action,
-      duration,
-      timestamp: new Date()
-    });
-
-    res.json({
-      success: true,
-      message: `Water command sent to device ${deviceId}`,
-      command: { action, duration }
-    });
-
-  } catch (error) {
-    console.error('❌ Manual water command error:', error);
-    res.status(500).json({
-      error: 'Failed to send water command',
-      details: error.message
-    });
-  }
-});
-
 // Delete schedule
 app.delete('/api/schedules/:scheduleId', async (req, res) => {
   try {
@@ -943,7 +999,8 @@ agenda.define('execute watering', async (job) => {
     if (!device || device.status !== 'online') {
       console.log(`⚠️ Device ${deviceId} is offline, marking schedule as failed`);
       await Schedule.findByIdAndUpdate(scheduleId, {
-        status: 'failed'
+        status: 'failed',
+        lastError: 'Device offline'
       });
       return;
     }
@@ -952,7 +1009,8 @@ agenda.define('execute watering', async (job) => {
     io.to(`device-${deviceId}`).emit('water-command', {
       action: 'water',
       duration,
-      scheduleId
+      scheduleId,
+      commandId: `schedule_${scheduleId}_${Date.now()}`
     });
 
     // Notify frontend
@@ -970,7 +1028,8 @@ agenda.define('execute watering', async (job) => {
     
     // Mark schedule as failed
     await Schedule.findByIdAndUpdate(scheduleId, {
-      status: 'failed'
+      status: 'failed',
+      lastError: error.message
     });
   }
 });
@@ -1009,7 +1068,12 @@ app.get('/', (req, res) => {
   res.json({
     message: '💧 Smart Watering System Backend',
     status: 'running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    compatibility: {
+      esp8266: true,
+      engineIO: ['v3', 'v4'],
+      transports: ['websocket', 'polling']
+    }
   });
 });
 
@@ -1036,8 +1100,10 @@ process.on('SIGINT', async () => {
 // Start server
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Socket.IO server ready`);
+  console.log(`📡 Socket.IO server ready with ESP8266 compatibility`);
   console.log(`🌐 Backend URL: http://localhost:${PORT}`);
+  console.log(`🔧 Engine.IO v3 support: ENABLED`);
+  console.log(`🔧 Engine.IO v4 support: ENABLED`);
 });
 
 module.exports = { app, io, agenda };
