@@ -1,6 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const { Server } = require('socket.io');
+const WebSocket = require('ws');
 const http = require('http');
 const cors = require('cors');
 const Agenda = require('agenda');
@@ -9,17 +9,11 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// UPDATED Socket.IO configuration for ESP8266 compatibility
-const io = require('socket.io')(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  },
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  transports: ['websocket', 'polling'],
-  allowUpgrades: true
-  // REMOVE the others!
+// WebSocket Server
+const wss = new WebSocket.Server({ 
+  server,
+  path: '/ws',
+  perMessageDeflate: false // Better for ESP8266
 });
 
 // Middleware
@@ -31,7 +25,7 @@ app.use(express.static('public'));
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/watering_system';
 
-// MongoDB Connection with better error handling
+// MongoDB Connection
 mongoose.connect(MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -40,15 +34,6 @@ mongoose.connect(MONGODB_URI, {
 })
 .then(() => console.log('✅ Connected to MongoDB'))
 .catch(err => console.error('❌ MongoDB connection error:', err));
-
-// Handle MongoDB disconnection
-mongoose.connection.on('disconnected', () => {
-  console.log('⚠️ MongoDB disconnected');
-});
-
-mongoose.connection.on('reconnected', () => {
-  console.log('✅ MongoDB reconnected');
-});
 
 // Initialize Agenda for job scheduling
 const agenda = new Agenda({ 
@@ -79,13 +64,11 @@ const deviceSchema = new mongoose.Schema({
     enum: ['idle', 'running'],
     default: 'idle'
   },
-  socketId: String,
   connectionAttempts: {
     type: Number,
     default: 0
   },
   lastConnectionError: String,
-  engineIOVersion: String, // Track which EIO version device is using
   createdAt: { 
     type: Date, 
     default: Date.now 
@@ -138,418 +121,491 @@ const connectionStats = {
   totalConnections: 0,
   activeConnections: 0,
   deviceConnections: 0,
-  frontendConnections: 0,
-  eio3Connections: 0,
-  eio4Connections: 0
+  frontendConnections: 0
 };
 
-// Enhanced Socket.IO connection handling with ESP8266 support
-io.on('connection', (socket) => {
+// WebSocket message types
+const MESSAGE_TYPE = {
+  // Device messages
+  DEVICE_JOIN: 'device_join',
+  DEVICE_STATUS: 'device_status',
+  PUMP_STATUS: 'pump_status',
+  HEARTBEAT: 'heartbeat',
+  COMMAND_ACK: 'command_ack',
+  SCHEDULE_EXECUTED: 'schedule_executed',
+  
+  // Frontend messages
+  FRONTEND_JOIN: 'frontend_join',
+  MANUAL_COMMAND: 'manual_command',
+  
+  // Server messages
+  WATER_COMMAND: 'water_command',
+  DEVICE_JOINED: 'device_joined',
+  HEARTBEAT_ACK: 'heartbeat_ack',
+  ERROR: 'error',
+  
+  // Broadcast messages
+  DEVICE_CONNECTED: 'device_connected',
+  DEVICE_DISCONNECTED: 'device_disconnected',
+  PUMP_STATUS_UPDATE: 'pump_status_update'
+};
+
+// Utility functions
+function sendMessage(ws, type, data = {}) {
+  if (ws.readyState === WebSocket.OPEN) {
+    const message = JSON.stringify({
+      type,
+      data,
+      timestamp: new Date().toISOString()
+    });
+    ws.send(message);
+    return true;
+  }
+  return false;
+}
+
+function broadcastToFrontends(type, data) {
+  connectedFrontends.forEach((info, ws) => {
+    sendMessage(ws, type, data);
+  });
+}
+
+function sendToDevice(deviceId, type, data) {
+  const deviceInfo = connectedDevices.get(deviceId);
+  if (deviceInfo && deviceInfo.ws) {
+    return sendMessage(deviceInfo.ws, type, data);
+  }
+  return false;
+}
+
+// WebSocket connection handling
+wss.on('connection', (ws, req) => {
   connectionStats.totalConnections++;
   connectionStats.activeConnections++;
   
-  // Detect Engine.IO version
-  const eioVersion = socket.handshake.query.EIO || socket.conn.protocol;
-  console.log(`🔌 Socket client connected: ${socket.id} (EIO: ${eioVersion}, Active: ${connectionStats.activeConnections})`);
+  console.log(`🔌 WebSocket client connected from ${req.socket.remoteAddress}`);
   
-  // Track EIO version stats
-  if (eioVersion === '3') {
-    connectionStats.eio3Connections++;
-  } else if (eioVersion === '4') {
-    connectionStats.eio4Connections++;
-  }
-  
-  // Send connection acknowledgment with compatibility info
-  socket.emit('connected', { 
-    status: 'connected', 
-    socketId: socket.id,
+  // Send welcome message
+  sendMessage(ws, 'connected', { 
+    status: 'connected',
     timestamp: new Date().toISOString(),
-    serverVersion: '2.0',
-    engineIOVersion: eioVersion,
-    pingInterval: 25000,
-    pingTimeout: 60000,
-    compatibility: {
-      eio3Supported: true,
-      eio4Supported: true
+    serverVersion: '2.0'
+  });
+
+  ws.on('message', async (message) => {
+    try {
+      const parsedMessage = JSON.parse(message);
+      const { type, data } = parsedMessage;
+      
+      console.log(`📥 WebSocket message: ${type}`, data);
+      
+      await handleWebSocketMessage(ws, type, data);
+      
+    } catch (error) {
+      console.error('❌ Error parsing WebSocket message:', error);
+      sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+        error: 'Invalid message format',
+        details: error.message 
+      });
     }
   });
 
-  // Enhanced device joining with ESP8266 compatibility
-  socket.on('join-device', async (deviceId) => {
-    try {
-      if (!deviceId) {
-        socket.emit('join-error', { error: 'Device ID is required' });
-        return;
-      }
-
-      console.log(`📱 Device ${deviceId} joining room with socket ${socket.id} (EIO: ${eioVersion})`);
-      
-      // Leave any existing rooms first
-      socket.rooms.forEach(room => {
-        if (room.startsWith('device-') && room !== socket.id) {
-          socket.leave(room);
-        }
-      });
-      
-      // Join new device room
-      socket.join(`device-${deviceId}`);
-      
-      // Check if device was already connected with different socket
-      const existingConnection = connectedDevices.get(deviceId);
-      if (existingConnection && existingConnection.socketId !== socket.id) {
-        console.log(`⚠️ Device ${deviceId} reconnecting with new socket (old: ${existingConnection.socketId}, new: ${socket.id})`);
-        // Disconnect old socket if still connected
-        const oldSocket = io.sockets.sockets.get(existingConnection.socketId);
-        if (oldSocket) {
-          oldSocket.disconnect(true);
-        }
-      }
-      
-      // Store device connection info
-      connectedDevices.set(deviceId, {
-        socketId: socket.id,
-        joinedAt: new Date(),
-        lastSeen: new Date(),
-        engineIOVersion: eioVersion,
-        reconnectCount: existingConnection ? (existingConnection.reconnectCount || 0) + 1 : 0
-      });
-      
-      connectionStats.deviceConnections++;
-      
-      // Update device status in database
-      const updateResult = await Device.findOneAndUpdate(
-        { deviceId },
-        { 
-          status: 'online',
-          lastSeen: new Date(),
-          socketId: socket.id,
-          connectionAttempts: 0,
-          lastConnectionError: null,
-          engineIOVersion: eioVersion
-        },
-        { 
-          upsert: true,
-          new: true,
-          runValidators: true
-        }
-      );
-      
-      console.log(`✅ Device ${deviceId} successfully joined and updated in database (EIO: ${eioVersion})`);
-      
-      // Send confirmation back to device with compatibility info
-      socket.emit('device-joined', { 
-        deviceId, 
-        status: 'success',
-        message: 'Successfully joined device room',
-        reconnectCount: connectedDevices.get(deviceId).reconnectCount,
-        engineIOVersion: eioVersion,
-        serverCompatibility: {
-          eio3: true,
-          eio4: true
-        },
-        timestamp: new Date().toISOString()
-      });
-      
-      // Notify all frontend clients about device connection
-      socket.broadcast.to('frontend').emit('device-connected', {
-        deviceId,
-        status: 'online',
-        engineIOVersion: eioVersion,
-        timestamp: new Date().toISOString(),
-        socketId: socket.id
-      });
-      
-    } catch (error) {
-      console.error(`❌ Error handling device join for ${deviceId}:`, error);
-      
-      // Update connection attempt count
-      try {
+  ws.on('close', async (code, reason) => {
+    connectionStats.activeConnections--;
+    console.log(`❌ WebSocket client disconnected: ${code} - ${reason}`);
+    
+    // Handle device disconnection
+    for (let [deviceId, deviceInfo] of connectedDevices.entries()) {
+      if (deviceInfo.ws === ws) {
+        console.log(`📱 Device ${deviceId} disconnected`);
+        
+        connectedDevices.delete(deviceId);
+        connectionStats.deviceConnections--;
+        
+        // Update device status in database
         await Device.findOneAndUpdate(
           { deviceId },
           { 
-            $inc: { connectionAttempts: 1 },
-            lastConnectionError: error.message,
+            status: 'offline',
+            pumpStatus: 'idle',
             lastSeen: new Date()
           }
         );
-      } catch (dbError) {
-        console.error('❌ Failed to update connection error in DB:', dbError);
-      }
-      
-      socket.emit('join-error', { 
-        error: 'Failed to join device room',
-        details: error.message,
-        deviceId,
-        suggestion: 'Try different Engine.IO version or connection method'
-      });
-    }
-  });
-
-  // Handle pump status updates with validation
-  socket.on('pump-status', async (data) => {
-    try {
-      if (!data || !data.deviceId || !data.status) {
-        socket.emit('status-error', { error: 'Invalid pump status data' });
-        return;
-      }
-
-      console.log('💧 Pump status update:', data);
-      
-      // Validate status value
-      const validStatuses = ['idle', 'running', 'stopped', 'error'];
-      if (!validStatuses.includes(data.status)) {
-        socket.emit('status-error', { error: 'Invalid pump status value' });
-        return;
-      }
-      
-      // Update device pump status with error handling
-      const updateData = { 
-        pumpStatus: data.status === 'stopped' ? 'idle' : data.status,
-        lastSeen: new Date()
-      };
-      
-      const device = await Device.findOneAndUpdate(
-        { deviceId: data.deviceId },
-        updateData,
-        { new: true }
-      );
-      
-      if (!device) {
-        console.warn(`⚠️ Pump status update for unknown device: ${data.deviceId}`);
-        socket.emit('status-error', { error: 'Device not found' });
-        return;
-      }
-      
-      // Update connection tracking
-      const connection = connectedDevices.get(data.deviceId);
-      if (connection) {
-        connection.lastSeen = new Date();
-      }
-      
-      // Enhanced status data for broadcasting
-      const statusUpdate = {
-        ...data,
-        timestamp: new Date().toISOString(),
-        deviceStatus: device.status,
-        lastSeen: device.lastSeen
-      };
-      
-      // Broadcast to frontend clients with acknowledgment
-      socket.broadcast.to('frontend').emit('pump-status-update', statusUpdate);
-      
-      // Send acknowledgment back to device
-      socket.emit('status-received', { 
-        deviceId: data.deviceId,
-        status: 'acknowledged',
-        timestamp: new Date().toISOString()
-      });
-      
-    } catch (error) {
-      console.error('❌ Error handling pump status update:', error);
-      socket.emit('status-error', { 
-        error: 'Failed to process status update',
-        details: error.message
-      });
-    }
-  });
-
-  // Enhanced frontend client handling
-  socket.on('join-frontend', async () => {
-    try {
-      console.log('🖥️ Frontend client joined');
-      socket.join('frontend');
-      
-      connectedFrontends.set(socket.id, {
-        joinedAt: new Date(),
-        lastActivity: new Date()
-      });
-      
-      connectionStats.frontendConnections++;
-      
-      // Send current system status to new frontend client
-      const devices = await Device.find().lean();
-      const activeSchedules = await Schedule.find({ 
-        status: 'pending',
-        time: { $gte: new Date() }
-      }).lean();
-      
-      socket.emit('frontend-joined', {
-        status: 'success',
-        timestamp: new Date().toISOString(),
-        systemStatus: {
-          totalDevices: devices.length,
-          onlineDevices: devices.filter(d => d.status === 'online').length,
-          activeSchedules: activeSchedules.length,
-          connectionStats
-        },
-        devices: devices.map(d => ({
-          deviceId: d.deviceId,
-          status: d.status,
-          pumpStatus: d.pumpStatus,
-          lastSeen: d.lastSeen,
-          socketId: d.socketId,
-          engineIOVersion: d.engineIOVersion
-        }))
-      });
-      
-    } catch (error) {
-      console.error('❌ Error handling frontend join:', error);
-      socket.emit('join-error', { 
-        error: 'Failed to join frontend',
-        details: error.message
-      });
-    }
-  });
-
-  // Handle heartbeat/ping from devices with ESP8266 compatibility
-  socket.on('heartbeat', async (data) => {
-    try {
-      if (data && data.deviceId) {
-        const connection = connectedDevices.get(data.deviceId);
-        if (connection) {
-          connection.lastSeen = new Date();
-        }
         
-        // Update device last seen in database
-        await Device.findOneAndUpdate(
-          { deviceId: data.deviceId },
-          { lastSeen: new Date() }
-        );
-        
-        // Send heartbeat acknowledgment
-        socket.emit('heartbeat-ack', { 
-          timestamp: new Date().toISOString(),
-          serverTime: Date.now()
-        });
-      }
-    } catch (error) {
-      console.error('❌ Error handling heartbeat:', error);
-    }
-  });
-
-  // Handle schedule execution acknowledgment
-  socket.on('schedule-executed', async (data) => {
-    try {
-      if (data && data.scheduleId && data.deviceId) {
-        console.log(`✅ Schedule execution confirmed by device ${data.deviceId}: ${data.scheduleId}`);
-        
-        // Update schedule status
-        await Schedule.findByIdAndUpdate(data.scheduleId, {
-          status: 'executed',
-          executedAt: new Date()
-        });
-        
-        // Notify frontend
-        socket.broadcast.to('frontend').emit('schedule-execution-confirmed', {
-          deviceId: data.deviceId,
-          scheduleId: data.scheduleId,
+        // Notify frontend clients
+        broadcastToFrontends(MESSAGE_TYPE.DEVICE_DISCONNECTED, {
+          deviceId,
+          status: 'offline',
           timestamp: new Date().toISOString()
         });
-      }
-    } catch (error) {
-      console.error('❌ Error handling schedule execution confirmation:', error);
-    }
-  });
-
-  // Handle command acknowledgments
-  socket.on('command-ack', async (data) => {
-    try {
-      if (data && data.commandId && data.deviceId) {
-        console.log(`✅ Command acknowledged by device ${data.deviceId}: ${data.commandId}`);
         
-        // Notify frontend
-        socket.broadcast.to('frontend').emit('command-acknowledged', {
-          deviceId: data.deviceId,
-          commandId: data.commandId,
-          status: data.status,
-          timestamp: new Date().toISOString()
-        });
+        break;
       }
-    } catch (error) {
-      console.error('❌ Error handling command acknowledgment:', error);
-    }
-  });
-
-  // Handle generic pong responses
-  socket.on('pong', (data) => {
-    if (data && data.deviceId) {
-      const connection = connectedDevices.get(data.deviceId);
-      if (connection) {
-        connection.lastSeen = new Date();
-      }
-    }
-  });
-
-  // Enhanced disconnect handling
-  socket.on('disconnect', async (reason) => {
-    connectionStats.activeConnections--;
-    
-    // Update EIO version stats
-    if (eioVersion === '3') {
-      connectionStats.eio3Connections--;
-    } else if (eioVersion === '4') {
-      connectionStats.eio4Connections--;
     }
     
-    console.log(`❌ Socket client disconnected: ${socket.id} (Reason: ${reason}, EIO: ${eioVersion})`);
-    
-    try {
-      // Handle device disconnection
-      for (let [deviceId, connectionInfo] of connectedDevices.entries()) {
-        if (connectionInfo.socketId === socket.id) {
-          console.log(`📱 Device ${deviceId} disconnected (EIO: ${eioVersion})`);
-          
-          connectedDevices.delete(deviceId);
-          connectionStats.deviceConnections--;
-          
-          // Update device status in database
-          await Device.findOneAndUpdate(
-            { deviceId },
-            { 
-              status: 'offline',
-              pumpStatus: 'idle',
-              socketId: null,
-              lastSeen: new Date()
-            }
-          );
-          
-          // Notify frontend clients
-          socket.broadcast.to('frontend').emit('device-disconnected', {
-            deviceId,
-            status: 'offline',
-            reason,
-            engineIOVersion: eioVersion,
-            timestamp: new Date().toISOString()
-          });
-          
-          break;
-        }
-      }
-      
-      // Handle frontend disconnection
-      if (connectedFrontends.has(socket.id)) {
-        connectedFrontends.delete(socket.id);
-        connectionStats.frontendConnections--;
-        console.log('🖥️ Frontend client disconnected');
-      }
-      
-    } catch (error) {
-      console.error('❌ Error handling disconnect:', error);
+    // Handle frontend disconnection
+    if (connectedFrontends.has(ws)) {
+      connectedFrontends.delete(ws);
+      connectionStats.frontendConnections--;
+      console.log('🖥️ Frontend client disconnected');
     }
   });
 
-  // Handle connection errors
-  socket.on('connect_error', (error) => {
-    console.error(`❌ Connection error for ${socket.id}:`, error);
+  ws.on('error', (error) => {
+    console.error('❌ WebSocket error:', error);
   });
 
-  // Handle Socket.IO errors
-  socket.on('error', (error) => {
-    console.error(`❌ Socket error for ${socket.id}:`, error);
-  });
+  // Send ping every 30 seconds to keep connection alive
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 30000);
 });
 
-// Connection monitoring and cleanup
+// WebSocket message handler
+async function handleWebSocketMessage(ws, type, data) {
+  switch (type) {
+    case MESSAGE_TYPE.DEVICE_JOIN:
+      await handleDeviceJoin(ws, data);
+      break;
+      
+    case MESSAGE_TYPE.PUMP_STATUS:
+      await handlePumpStatus(ws, data);
+      break;
+      
+    case MESSAGE_TYPE.HEARTBEAT:
+      await handleHeartbeat(ws, data);
+      break;
+      
+    case MESSAGE_TYPE.COMMAND_ACK:
+      await handleCommandAck(ws, data);
+      break;
+      
+    case MESSAGE_TYPE.SCHEDULE_EXECUTED:
+      await handleScheduleExecuted(ws, data);
+      break;
+      
+    case MESSAGE_TYPE.FRONTEND_JOIN:
+      await handleFrontendJoin(ws);
+      break;
+      
+    case MESSAGE_TYPE.MANUAL_COMMAND:
+      await handleManualCommand(ws, data);
+      break;
+      
+    default:
+      console.warn(`❓ Unknown message type: ${type}`);
+      sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+        error: 'Unknown message type',
+        type 
+      });
+  }
+}
+
+// Message handlers
+async function handleDeviceJoin(ws, data) {
+  const { deviceId } = data;
+  
+  if (!deviceId) {
+    sendMessage(ws, MESSAGE_TYPE.ERROR, { error: 'Device ID is required' });
+    return;
+  }
+  
+  try {
+    console.log(`📱 Device ${deviceId} joining`);
+    
+    // Check if device was already connected
+    const existingConnection = connectedDevices.get(deviceId);
+    if (existingConnection && existingConnection.ws !== ws) {
+      console.log(`⚠️ Device ${deviceId} reconnecting with new WebSocket`);
+      // Close old connection
+      if (existingConnection.ws.readyState === WebSocket.OPEN) {
+        existingConnection.ws.close();
+      }
+    }
+    
+    // Store device connection
+    connectedDevices.set(deviceId, {
+      ws,
+      joinedAt: new Date(),
+      lastSeen: new Date(),
+      reconnectCount: existingConnection ? (existingConnection.reconnectCount || 0) + 1 : 0
+    });
+    
+    connectionStats.deviceConnections++;
+    
+    // Update device status in database
+    const device = await Device.findOneAndUpdate(
+      { deviceId },
+      { 
+        status: 'online',
+        lastSeen: new Date(),
+        connectionAttempts: 0,
+        lastConnectionError: null
+      },
+      { 
+        upsert: true,
+        new: true,
+        runValidators: true
+      }
+    );
+    
+    console.log(`✅ Device ${deviceId} successfully joined`);
+    
+    // Send confirmation to device
+    sendMessage(ws, MESSAGE_TYPE.DEVICE_JOINED, { 
+      deviceId, 
+      status: 'success',
+      message: 'Successfully joined',
+      reconnectCount: connectedDevices.get(deviceId).reconnectCount
+    });
+    
+    // Notify frontend clients
+    broadcastToFrontends(MESSAGE_TYPE.DEVICE_CONNECTED, {
+      deviceId,
+      status: 'online',
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error(`❌ Error handling device join for ${deviceId}:`, error);
+    
+    await Device.findOneAndUpdate(
+      { deviceId },
+      { 
+        $inc: { connectionAttempts: 1 },
+        lastConnectionError: error.message,
+        lastSeen: new Date()
+      }
+    ).catch(err => console.error('Failed to update DB:', err));
+    
+    sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+      error: 'Failed to join',
+      details: error.message,
+      deviceId
+    });
+  }
+}
+
+async function handlePumpStatus(ws, data) {
+  const { deviceId, status } = data;
+  
+  if (!deviceId || !status) {
+    sendMessage(ws, MESSAGE_TYPE.ERROR, { error: 'Invalid pump status data' });
+    return;
+  }
+  
+  try {
+    console.log(`💧 Pump status update: ${deviceId} - ${status}`);
+    
+    // Update device pump status
+    const device = await Device.findOneAndUpdate(
+      { deviceId },
+      { 
+        pumpStatus: status === 'stopped' ? 'idle' : status,
+        lastSeen: new Date()
+      },
+      { new: true }
+    );
+    
+    if (!device) {
+      sendMessage(ws, MESSAGE_TYPE.ERROR, { error: 'Device not found' });
+      return;
+    }
+    
+    // Update connection tracking
+    const connection = connectedDevices.get(deviceId);
+    if (connection) {
+      connection.lastSeen = new Date();
+    }
+    
+    // Broadcast to frontend clients
+    broadcastToFrontends(MESSAGE_TYPE.PUMP_STATUS_UPDATE, {
+      deviceId,
+      status,
+      timestamp: new Date().toISOString(),
+      deviceStatus: device.status,
+      lastSeen: device.lastSeen
+    });
+    
+    // Send acknowledgment
+    sendMessage(ws, 'status_received', { 
+      deviceId,
+      status: 'acknowledged'
+    });
+    
+  } catch (error) {
+    console.error('❌ Error handling pump status:', error);
+    sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+      error: 'Failed to process status update',
+      details: error.message
+    });
+  }
+}
+
+async function handleHeartbeat(ws, data) {
+  const { deviceId } = data;
+  
+  if (deviceId) {
+    const connection = connectedDevices.get(deviceId);
+    if (connection) {
+      connection.lastSeen = new Date();
+    }
+    
+    // Update device last seen in database
+    await Device.findOneAndUpdate(
+      { deviceId },
+      { lastSeen: new Date() }
+    ).catch(err => console.error('Failed to update heartbeat:', err));
+    
+    // Send heartbeat acknowledgment
+    sendMessage(ws, MESSAGE_TYPE.HEARTBEAT_ACK, { 
+      timestamp: new Date().toISOString(),
+      serverTime: Date.now()
+    });
+  }
+}
+
+async function handleCommandAck(ws, data) {
+  const { commandId, deviceId, status } = data;
+  
+  if (commandId && deviceId) {
+    console.log(`✅ Command acknowledged by device ${deviceId}: ${commandId}`);
+    
+    // Notify frontend
+    broadcastToFrontends('command_acknowledged', {
+      deviceId,
+      commandId,
+      status,
+      timestamp: new Date().toISOString()
+    });
+  }
+}
+
+async function handleScheduleExecuted(ws, data) {
+  const { scheduleId, deviceId } = data;
+  
+  if (scheduleId && deviceId) {
+    console.log(`✅ Schedule execution confirmed by device ${deviceId}: ${scheduleId}`);
+    
+    // Update schedule status
+    await Schedule.findByIdAndUpdate(scheduleId, {
+      status: 'executed',
+      executedAt: new Date()
+    }).catch(err => console.error('Failed to update schedule:', err));
+    
+    // Notify frontend
+    broadcastToFrontends('schedule_execution_confirmed', {
+      deviceId,
+      scheduleId,
+      timestamp: new Date().toISOString()
+    });
+  }
+}
+
+async function handleFrontendJoin(ws) {
+  try {
+    console.log('🖥️ Frontend client joined');
+    
+    connectedFrontends.set(ws, {
+      joinedAt: new Date(),
+      lastActivity: new Date()
+    });
+    
+    connectionStats.frontendConnections++;
+    
+    // Send current system status
+    const devices = await Device.find().lean();
+    const activeSchedules = await Schedule.find({ 
+      status: 'pending',
+      time: { $gte: new Date() }
+    }).lean();
+    
+    sendMessage(ws, 'frontend_joined', {
+      status: 'success',
+      systemStatus: {
+        totalDevices: devices.length,
+        onlineDevices: devices.filter(d => d.status === 'online').length,
+        activeSchedules: activeSchedules.length,
+        connectionStats
+      },
+      devices: devices.map(d => ({
+        deviceId: d.deviceId,
+        status: d.status,
+        pumpStatus: d.pumpStatus,
+        lastSeen: d.lastSeen
+      }))
+    });
+    
+  } catch (error) {
+    console.error('❌ Error handling frontend join:', error);
+    sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+      error: 'Failed to join frontend',
+      details: error.message
+    });
+  }
+}
+
+async function handleManualCommand(ws, data) {
+  const { deviceId, action, duration } = data;
+  
+  if (!deviceId || !action) {
+    sendMessage(ws, MESSAGE_TYPE.ERROR, { error: 'Device ID and action are required' });
+    return;
+  }
+  
+  try {
+    // Check if device exists and is online
+    const device = await Device.findOne({ deviceId });
+    if (!device) {
+      sendMessage(ws, MESSAGE_TYPE.ERROR, { error: 'Device not found' });
+      return;
+    }
+    
+    if (device.status !== 'online') {
+      sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+        error: 'Device is offline',
+        deviceStatus: device.status,
+        lastSeen: device.lastSeen
+      });
+      return;
+    }
+    
+    const commandData = {
+      action,
+      duration: duration || 0,
+      commandId: `cmd_${Date.now()}`,
+      timestamp: new Date().toISOString()
+    };
+    
+    // Send command to device
+    const sent = sendToDevice(deviceId, MESSAGE_TYPE.WATER_COMMAND, commandData);
+    
+    if (sent) {
+      sendMessage(ws, 'command_sent', {
+        success: true,
+        message: `Command sent to device ${deviceId}`,
+        command: commandData
+      });
+    } else {
+      sendMessage(ws, MESSAGE_TYPE.ERROR, { 
+        error: 'Failed to send command - device not connected'
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Manual command error:', error);
+    sendMessage(ws, MESSAGE_TYPE.ERROR, {
+      error: 'Failed to send command',
+      details: error.message
+    });
+  }
+}
+
+// Connection monitoring
 setInterval(async () => {
   try {
     const now = new Date();
@@ -568,13 +624,12 @@ setInterval(async () => {
           { deviceId },
           { 
             status: 'offline',
-            pumpStatus: 'idle',
-            socketId: null
+            pumpStatus: 'idle'
           }
         );
         
         // Notify frontends
-        io.to('frontend').emit('device-disconnected', {
+        broadcastToFrontends(MESSAGE_TYPE.DEVICE_DISCONNECTED, {
           deviceId,
           status: 'offline',
           reason: 'timeout',
@@ -583,26 +638,15 @@ setInterval(async () => {
       }
     }
     
-    // Cleanup frontend connections
-    for (let [socketId, connectionInfo] of connectedFrontends.entries()) {
-      if (connectionInfo.lastActivity < fiveMinutesAgo) {
-        const socket = io.sockets.sockets.get(socketId);
-        if (!socket || !socket.connected) {
-          connectedFrontends.delete(socketId);
-          connectionStats.frontendConnections--;
-        }
-      }
-    }
-    
   } catch (error) {
     console.error('❌ Error in connection cleanup:', error);
   }
-}, 60000); // Run every minute
+}, 60000);
 
-// API Routes with enhanced error handling
+// REST API Routes (keeping existing ones)
 app.post('/api/devices/register', async (req, res) => {
   try {
-    const { deviceId, ip, timestamp } = req.body;
+    const { deviceId, ip } = req.body;
 
     if (!deviceId) {
       return res.status(400).json({ error: 'Device ID is required' });
@@ -610,11 +654,9 @@ app.post('/api/devices/register', async (req, res) => {
 
     console.log(`📡 Device registration request: ${deviceId} from IP: ${ip}`);
 
-    // Find existing device or create new one
     let device = await Device.findOne({ deviceId });
 
     if (device) {
-      // Update existing device
       device.ip = ip;
       device.lastSeen = new Date();
       device.status = 'online';
@@ -623,7 +665,6 @@ app.post('/api/devices/register', async (req, res) => {
       await device.save();
       console.log(`🔄 Updated existing device: ${deviceId}`);
     } else {
-      // Create new device
       device = new Device({
         deviceId,
         ip,
@@ -639,17 +680,11 @@ app.post('/api/devices/register', async (req, res) => {
       device: {
         deviceId: device.deviceId,
         status: device.status,
-        lastSeen: device.lastSeen,
-        connectionAttempts: device.connectionAttempts
+        lastSeen: device.lastSeen
       },
       serverInfo: {
-        socketUrl: req.get('host'),
-        timestamp: new Date().toISOString(),
-        socketIOCompatibility: {
-          eio3Supported: true,
-          eio4Supported: true,
-          transports: ['websocket', 'polling']
-        }
+        wsUrl: `ws://${req.get('host')}/ws`,
+        timestamp: new Date().toISOString()
       }
     });
 
@@ -662,7 +697,7 @@ app.post('/api/devices/register', async (req, res) => {
   }
 });
 
-// Enhanced manual water command with better error handling
+// Manual water command via REST API
 app.post('/api/devices/:deviceId/water', async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -672,7 +707,6 @@ app.post('/api/devices/:deviceId/water', async (req, res) => {
       return res.status(400).json({ error: 'Action is required' });
     }
 
-    // Check if device exists and is online
     const device = await Device.findOne({ deviceId });
     if (!device) {
       return res.status(404).json({ error: 'Device not found' });
@@ -686,18 +720,6 @@ app.post('/api/devices/:deviceId/water', async (req, res) => {
       });
     }
 
-    // Check if device is connected via socket
-    const connection = connectedDevices.get(deviceId);
-    if (!connection) {
-      return res.status(409).json({ 
-        error: 'Device is not connected via socket',
-        suggestion: 'Device may need to reconnect'
-      });
-    }
-
-    console.log(`💧 Manual water command for ${deviceId}: ${action} (${duration}ms)`);
-
-    // Prepare command data
     const commandData = {
       action,
       duration: duration || 0,
@@ -705,34 +727,19 @@ app.post('/api/devices/:deviceId/water', async (req, res) => {
       timestamp: new Date().toISOString()
     };
 
-    // Send command to device via Socket.IO with timeout
-    const deviceRoom = `device-${deviceId}`;
-    const room = io.sockets.adapter.rooms[deviceRoom];
-    const socketsInRoom = room ? Object.keys(room.sockets) : [];
-    
-    if (socketsInRoom.length === 0) {
-      return res.status(409).json({ 
-        error: 'No active socket connection for device',
-        deviceId
+    const sent = sendToDevice(deviceId, MESSAGE_TYPE.WATER_COMMAND, commandData);
+
+    if (sent) {
+      res.json({
+        success: true,
+        message: `Water command sent to device ${deviceId}`,
+        command: commandData
+      });
+    } else {
+      res.status(409).json({ 
+        error: 'Device is not connected via WebSocket'
       });
     }
-
-    // Send to device
-    io.to(deviceRoom).emit('water-command', commandData);
-    
-    // Also broadcast to frontend
-    io.to('frontend').emit('manual-command', {
-      deviceId,
-      ...commandData
-    });
-
-    res.json({
-      success: true,
-      message: `Water command sent to device ${deviceId}`,
-      command: commandData,
-      activeConnections: socketsInRoom.length,
-      deviceEngineIO: connection.engineIOVersion
-    });
 
   } catch (error) {
     console.error('❌ Manual water command error:', error);
@@ -743,53 +750,10 @@ app.post('/api/devices/:deviceId/water', async (req, res) => {
   }
 });
 
-// System status endpoint with EIO version info
-app.get('/api/system/status', async (req, res) => {
-  try {
-    const devices = await Device.find().lean();
-    const schedules = await Schedule.find({ status: 'pending' }).lean();
-    
-    res.json({
-      success: true,
-      systemStatus: {
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        connections: connectionStats,
-        database: {
-          connected: mongoose.connection.readyState === 1,
-          totalDevices: devices.length,
-          onlineDevices: devices.filter(d => d.status === 'online').length,
-          pendingSchedules: schedules.length
-        },
-        memory: process.memoryUsage(),
-        socketConnections: {
-          total: io.engine.clientsCount,
-          devices: connectedDevices.size,
-          frontends: connectedFrontends.size
-        },
-        compatibility: {
-          engineIOVersions: {
-            v3Connections: connectionStats.eio3Connections,
-            v4Connections: connectionStats.eio4Connections
-          },
-          supportedTransports: ['websocket', 'polling'],
-          esp8266Compatible: true
-        }
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Failed to get system status',
-      details: error.message
-    });
-  }
-});
-
 // Get device info
 app.get('/api/devices/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
-    
     const device = await Device.findOne({ deviceId });
     
     if (!device) {
@@ -810,36 +774,16 @@ app.get('/api/devices/:deviceId', async (req, res) => {
   }
 });
 
-// Get all devices
-app.get('/api/devices', async (req, res) => {
-  try {
-    const devices = await Device.find().sort({ createdAt: -1 });
-    res.json({
-      success: true,
-      devices
-    });
-  } catch (error) {
-    console.error('❌ Get devices error:', error);
-    res.status(500).json({
-      error: 'Failed to get devices',
-      details: error.message
-    });
-  }
-});
-
-// Get device schedules
+// Schedule endpoints (keeping existing ones)
 app.get('/api/devices/:deviceId/schedules', async (req, res) => {
   try {
     const { deviceId } = req.params;
     
-    // Get pending schedules for the device
     const schedules = await Schedule.find({
       deviceId,
       status: 'pending',
-      time: { $gte: new Date() } // Only future schedules
+      time: { $gte: new Date() }
     }).sort({ time: 1 });
-
-    console.log(`📅 Fetched ${schedules.length} schedules for device: ${deviceId}`);
 
     res.json({
       success: true,
@@ -860,7 +804,6 @@ app.get('/api/devices/:deviceId/schedules', async (req, res) => {
   }
 });
 
-// Create new schedule
 app.post('/api/schedules', async (req, res) => {
   try {
     const { deviceId, time, duration } = req.body;
@@ -871,13 +814,11 @@ app.post('/api/schedules', async (req, res) => {
       });
     }
 
-    // Validate device exists
     const device = await Device.findOne({ deviceId });
     if (!device) {
       return res.status(404).json({ error: 'Device not found' });
     }
 
-    // Create schedule
     const schedule = new Schedule({
       deviceId,
       time: new Date(time),
@@ -892,8 +833,6 @@ app.post('/api/schedules', async (req, res) => {
       deviceId,
       duration: parseInt(duration)
     });
-
-    console.log(`⏰ Created schedule for device ${deviceId} at ${time} for ${duration}ms`);
 
     res.json({
       success: true,
@@ -916,59 +855,6 @@ app.post('/api/schedules', async (req, res) => {
   }
 });
 
-// Get all schedules
-app.get('/api/schedules', async (req, res) => {
-  try {
-    const { deviceId, status } = req.query;
-    
-    let query = {};
-    if (deviceId) query.deviceId = deviceId;
-    if (status) query.status = status;
-
-    const schedules = await Schedule.find(query).sort({ time: 1 });
-
-    res.json({
-      success: true,
-      schedules
-    });
-
-  } catch (error) {
-    console.error('❌ Get all schedules error:', error);
-    res.status(500).json({
-      error: 'Failed to get schedules',
-      details: error.message
-    });
-  }
-});
-
-// Delete schedule
-app.delete('/api/schedules/:scheduleId', async (req, res) => {
-  try {
-    const { scheduleId } = req.params;
-
-    const schedule = await Schedule.findByIdAndDelete(scheduleId);
-    
-    if (!schedule) {
-      return res.status(404).json({ error: 'Schedule not found' });
-    }
-
-    // Cancel the agenda job
-    await agenda.cancel({ 'data.scheduleId': scheduleId });
-
-    res.json({
-      success: true,
-      message: 'Schedule deleted successfully'
-    });
-
-  } catch (error) {
-    console.error('❌ Delete schedule error:', error);
-    res.status(500).json({
-      error: 'Failed to delete schedule',
-      details: error.message
-    });
-  }
-});
-
 // Agenda job definitions
 agenda.define('execute watering', async (job) => {
   const { scheduleId, deviceId, duration } = job.attrs.data;
@@ -976,13 +862,11 @@ agenda.define('execute watering', async (job) => {
   try {
     console.log(`⏰ Executing scheduled watering for device ${deviceId} (${duration}ms)`);
 
-    // Update schedule status
     await Schedule.findByIdAndUpdate(scheduleId, {
       status: 'executed',
       executedAt: new Date()
     });
 
-    // Check if device is online
     const device = await Device.findOne({ deviceId });
     if (!device || device.status !== 'online') {
       console.log(`⚠️ Device ${deviceId} is offline, marking schedule as failed`);
@@ -993,28 +877,34 @@ agenda.define('execute watering', async (job) => {
       return;
     }
 
-    // Send watering command to device
-    io.to(`device-${deviceId}`).emit('water-command', {
+    // Send watering command via WebSocket
+    const sent = sendToDevice(deviceId, MESSAGE_TYPE.WATER_COMMAND, {
       action: 'water',
       duration,
       scheduleId,
       commandId: `schedule_${scheduleId}_${Date.now()}`
     });
 
-    // Notify frontend
-    io.to('frontend').emit('schedule-executed', {
-      deviceId,
-      scheduleId,
-      duration,
-      timestamp: new Date()
-    });
-
-    console.log(`✅ Scheduled watering command sent to device ${deviceId}`);
+    if (sent) {
+      // Notify frontend
+      broadcastToFrontends('schedule_executed', {
+        deviceId,
+        scheduleId,
+        duration,
+        timestamp: new Date()
+      });
+      
+      console.log(`✅ Scheduled watering command sent to device ${deviceId}`);
+    } else {
+      await Schedule.findByIdAndUpdate(scheduleId, {
+        status: 'failed',
+        lastError: 'Device not connected'
+      });
+    }
 
   } catch (error) {
     console.error('❌ Scheduled watering execution error:', error);
     
-    // Mark schedule as failed
     await Schedule.findByIdAndUpdate(scheduleId, {
       status: 'failed',
       lastError: error.message
@@ -1022,55 +912,19 @@ agenda.define('execute watering', async (job) => {
   }
 });
 
-// Clean up expired schedules (run every hour)
-agenda.define('cleanup expired schedules', async (job) => {
-  try {
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    
-    const result = await Schedule.updateMany(
-      {
-        status: 'pending',
-        time: { $lt: oneDayAgo }
-      },
-      { status: 'expired' }
-    );
-
-    console.log(`🧹 Marked ${result.modifiedCount} expired schedules`);
-
-  } catch (error) {
-    console.error('❌ Cleanup expired schedules error:', error);
-  }
-});
-
 // Start agenda
 (async function() {
   await agenda.start();
   console.log('⏰ Agenda scheduler started');
-  
-  // Schedule cleanup job to run every hour
-  await agenda.every('1 hour', 'cleanup expired schedules');
 })();
 
-// Basic route for health check
+// Basic route
 app.get('/', (req, res) => {
   res.json({
-    message: '💧 Smart Watering System Backend',
+    message: '💧 Smart Watering System Backend (WebSocket)',
     status: 'running',
     timestamp: new Date().toISOString(),
-    compatibility: {
-      esp8266: true,
-      engineIO: ['v3', 'v4'],
-      transports: ['websocket', 'polling']
-    }
-  });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('❌ Unhandled error:', err);
-  res.status(500).json({
-    error: 'Internal server error',
-    details: err.message
+    wsEndpoint: '/ws'
   });
 });
 
@@ -1079,19 +933,19 @@ process.on('SIGINT', async () => {
   console.log('🛑 Shutting down gracefully...');
   await agenda.stop();
   await mongoose.connection.close();
-  server.close(() => {
-    console.log('✅ Server shut down complete');
-    process.exit(0);
+  wss.close(() => {
+    server.close(() => {
+      console.log('✅ Server shut down complete');
+      process.exit(0);
+    });
   });
 });
 
 // Start server
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Socket.IO server ready with ESP8266 compatibility`);
+  console.log(`📡 WebSocket server ready at /ws`);
   console.log(`🌐 Backend URL: http://localhost:${PORT}`);
-  console.log(`🔧 Engine.IO v3 support: ENABLED`);
-  console.log(`🔧 Engine.IO v4 support: ENABLED`);
 });
 
-module.exports = { app, io, agenda };
+module.exports = { app, wss, agenda };
