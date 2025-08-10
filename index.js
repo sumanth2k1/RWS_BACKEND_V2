@@ -1050,6 +1050,161 @@ app.post('/api/schedules', async (req, res) => {
   }
 });
 
+app.delete('/api/schedules/:scheduleId', async (req, res) => {
+  try {
+    const { scheduleId } = req.params;
+    
+    console.log(`🗑️ Deleting schedule/alarm ${scheduleId}`);
+    
+    const schedule = await Schedule.findById(scheduleId);
+    if (!schedule) {
+      return res.status(404).json({ error: 'Schedule not found' });
+    }
+    
+    // Cancel any pending Agenda jobs for this schedule
+    await agenda.cancel({ 'data.scheduleId': scheduleId });
+    
+    // Delete the schedule
+    await Schedule.findByIdAndDelete(scheduleId);
+    
+    res.json({
+      success: true,
+      message: 'Schedule deleted successfully',
+      scheduleId
+    });
+    
+  } catch (error) {
+    console.error('❌ Delete schedule error:', error);
+    res.status(500).json({
+      error: 'Failed to delete schedule',
+      details: error.message
+    });
+  }
+});
+
+// Toggle schedule/alarm active status
+app.post('/api/schedules/:scheduleId/toggle', async (req, res) => {
+  try {
+    const { scheduleId } = req.params;
+    const { isActive } = req.body;
+    
+    console.log(`🔄 Toggling schedule/alarm ${scheduleId} to ${isActive ? 'active' : 'inactive'}`);
+    
+    const schedule = await Schedule.findById(scheduleId);
+    if (!schedule) {
+      return res.status(404).json({ error: 'Schedule not found' });
+    }
+    
+    if (isActive) {
+      // Reactivate or reschedule
+      if (schedule.isRecurring && schedule.days && schedule.days.length > 0) {
+        // Calculate next occurrence for recurring alarms
+        const timeOfDay = new Date(schedule.time);
+        const hour = timeOfDay.getHours();
+        const minute = timeOfDay.getMinutes();
+        
+        // Find the next valid day
+        const now = new Date();
+        const currentDay = now.getDay();
+        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        
+        let nextDay = -1;
+        let daysToAdd = 0;
+        
+        for (let i = 0; i < 7; i++) {
+          const checkDay = (currentDay + i) % 7;
+          const checkDayName = dayNames[checkDay];
+          
+          if (schedule.days.includes(checkDayName)) {
+            // If it's today, check if the time has passed
+            if (i === 0) {
+              const todayTarget = new Date();
+              todayTarget.setHours(hour, minute, 0, 0);
+              
+              if (now > todayTarget) {
+                continue; // Skip today if time has passed
+              }
+            }
+            
+            nextDay = checkDay;
+            daysToAdd = i;
+            break;
+          }
+        }
+        
+        // If we didn't find a day in the coming week, take the first day from the array
+        if (nextDay === -1) {
+          nextDay = dayNames.indexOf(schedule.days[0]);
+          daysToAdd = (7 - currentDay + nextDay) % 7;
+          if (daysToAdd === 0) daysToAdd = 7; // If same day, schedule for next week
+        }
+        
+        // Set next run date
+        const nextRunDate = new Date();
+        nextRunDate.setDate(now.getDate() + daysToAdd);
+        nextRunDate.setHours(hour, minute, 0, 0);
+        
+        // Update schedule
+        await Schedule.findByIdAndUpdate(scheduleId, {
+          status: 'pending',
+          nextRunDate,
+          executed: false
+        });
+        
+        // Schedule job
+        await agenda.schedule(nextRunDate, 'execute watering', {
+          scheduleId: schedule._id.toString(),
+          deviceId: schedule.deviceId,
+          duration: schedule.duration,
+          isRecurring: true,
+          days: schedule.days
+        });
+        
+      } else {
+        // One-time schedule
+        await Schedule.findByIdAndUpdate(scheduleId, {
+          status: 'pending',
+          executed: false
+        });
+        
+        // Schedule job
+        await agenda.schedule(schedule.time, 'execute watering', {
+          scheduleId: schedule._id.toString(),
+          deviceId: schedule.deviceId,
+          duration: schedule.duration
+        });
+      }
+      
+      res.json({
+        success: true,
+        message: 'Schedule activated successfully',
+        scheduleId
+      });
+      
+    } else {
+      // Deactivate
+      await agenda.cancel({ 'data.scheduleId': scheduleId });
+      
+      await Schedule.findByIdAndUpdate(scheduleId, {
+        status: 'expired'
+      });
+      
+      res.json({
+        success: true,
+        message: 'Schedule deactivated successfully',
+        scheduleId
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Toggle schedule error:', error);
+    res.status(500).json({
+      error: 'Failed to toggle schedule',
+      details: error.message
+    });
+  }
+});
+
 // Manual water command
 app.post('/api/devices/:deviceId/water', async (req, res) => {
   try {
